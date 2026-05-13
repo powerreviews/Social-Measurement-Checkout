@@ -165,3 +165,59 @@ Derived from git history; current HEAD is `3766eda`.
 
   Over the full repo lifetime, churn is: `.github/workflows/secrets-scan.yml` (2 commits), `README.md` (2 commits), `checkout.js` (1 commit), `.whitesource` (1 commit).
 - **Recent major changes**: _No major changes in the last 6 months._ The only recent commit added a `.whitesource` Mend/WhiteSource configuration file; no runtime, API, or workflow logic changed.
+
+---
+
+## Revised Summary
+_Revised on 2026-05-12 against commit 19242db_
+
+### Overview
+This repo is a customer-facing reference snippet for the **PowerReviews "Social Measurement" conversion beacon** — a single `checkout.js` paste-block that merchants embed on their order-confirmation page to fire an order/user payload at the v1 `tracker.js` analytics endpoint. It is owned by the integration/customer-success surface (no clear engineering owner in git history) and sits entirely outside the org's runtime services: the beacon's destination is the externally-hosted `static.powerreviews.com/t/v1/tracker.js` shipped from `pufferfish-static` (the Maven WAR that packages the legacy v1 widget + tracker library), and the resulting beacons land in the `feed-services` / `feeds Postgres` ingestion path via the `beacon-data` SQS queue documented in the org shared-infrastructure table. Effectively this repo is documentation/sample code; no service in the org imports or builds from it.
+
+### Tech Stack
+| Category | Technology | Version |
+|----------|-----------|---------|
+| Language | JavaScript (browser, no transpile) | _Not specified_ |
+| Framework | PowerReviews `tracker.js` (CDN-loaded) | v1 |
+| Database | _None_ | _N/A_ |
+| Build Tool | _None_ | _N/A_ |
+| CI/CD | GitHub Actions (TruffleHog secrets scan only) | _N/A_ |
+| Cloud/Infra | None in-repo (artifact is copy-paste HTML) | _N/A_ |
+
+### Consumers
+| Consumer | Type | How They Use It |
+|----------|------|----------------|
+| Merchant order-confirmation pages | External (customer storefronts) | Paste/template the snippet to fire the `"c"` conversion beacon |
+| `pufferfish-static` (v1 `tracker.js` on `static.powerreviews.com`) | Sibling org repo (build/host of the script) | Receives the script-tag load; runs the actual beacon transmission code |
+| `feed-services` (via `beacon-data` SQS) | Downstream org repo | Consumes the resulting beacon payloads as order-feed input for review solicitation (per org Shared Infrastructure: `beacon-data` SQS → `feed-services`) |
+| GitHub Actions runner | CI service | Runs the scheduled TruffleHog secrets scan |
+| Slack `#github-token-scan` | External service | Receives `@devops-team` alerts on scan failure |
+
+### Dependencies on Org Repos
+The base extraction marked "no dependencies," which is true at the code-level (no `package.json`, no submodules). Cross-referencing the org context surfaces two indirect runtime relationships worth recording:
+| Repo | Reason |
+|------|--------|
+| `pufferfish-static` | Builds and publishes the `tracker.js` v1 asset that this snippet loads from `static.powerreviews.com/t/v1/tracker.js`. Org catalog explicitly calls it the "Maven-built WAR packaging legacy v1 JavaScript widget library and tracker.js analytics." |
+| `feed-services` | Downstream consumer of beacons fired by this snippet — org-summary lists `beacon-data` SQS → `feed-services` as the ingest path. The README's "automatically create order feeds" claim resolves into this Ruby service. |
+| `powerreviews-pufferfish` / `pufferfish-shared-services` | The tracking/conversion datastore historically lived behind the pufferfish monolith; modern path appears to flow via `feed-services` into the `feeds`/`reviews` Postgres clusters listed under Shared Infrastructure. |
+| `whitesource-config` | Org-wide Mend scan policy that the `.whitesource` file (added 2026-03-23) opts into. |
+
+### Upgrade Alerts
+| Dependency | Current Version | Issue | Severity |
+|-----------|----------------|-------|----------|
+| `actions/checkout@master` | floating `master` | Supply-chain risk: third-party Action pinned to a moving ref; upstream renamed default branch to `main`, so `master` is effectively unmaintained for this Action. Pin to a SHA or tagged release. | Critical |
+| `edplato/trufflehog-actions-scan@master` | floating `master` | Unmaintained third-party Action wrapping legacy TruffleHog v2 (deprecated by the upstream project); pinned to a mutable branch so code can change under the workflow without review. Org context shows ~80 repos still using this same pattern — fleet-wide hygiene issue, not unique here. | Critical |
+| `//static.powerreviews.com/t/v1/tracker.js` | v1 | Protocol-relative URL plus the v1 endpoint has been the integration surface unchanged since 2016. Verify v1 is still the supported tracker version given the modern beacon path lives in `feed-services`/`ui-library` territory. | Severe |
+
+### Coupling Profile
+| Dependency | Protocol | Frequency Pattern | Failure Mode |
+|-----------|----------|-------------------|--------------|
+| `pufferfish-static` (`tracker.js` v1) | sync HTTP (script tag from CDN) | per-request (each order-confirmation page view) | hard at load; the IIFE wraps the call in `try/catch` and logs via `window.console.log`, so a runtime error in `tracker.js` degrades silently to "no beacon" without breaking the merchant page |
+| `feed-services` (via tracker → `beacon-data` SQS) | message queue (indirect; HTTPS beacon → SQS publish inside `tracker.js`) | event-triggered (one per checkout) | queued (eventually retries on the SQS side); from this repo's perspective the call is fire-and-forget — no acknowledgement, no retry on the client |
+| GitHub Actions → TruffleHog | sync HTTP (Action invocation) | scheduled (cron `0 14 * * 1-5`) | soft (Slack-only alert on failure; no gating) |
+| Slack webhook | webhook (outbound HTTPS) | event-triggered (on scan failure) | soft (best-effort notification) |
+
+### Architectural Notes
+- **Shared infrastructure**: This repo touches none directly, but its data-flow lands in two of the org's most-shared resources — the `beacon-data` SQS topic (consumed by `feed-services`) and downstream the `reviews`/`feeds` Postgres clusters (used by ~16 repos collectively). Any v1-tracker deprecation needs coordination with `pufferfish-static`, `feed-services`, and the read path in `feed-services` Sidekiq workers.
+- **Bounded-context overlaps**: The snippet's payload (`merchantId`, `merchantGroupId`, `merchantUserId`, `orderId`, `orderItems[pageId, pageIdVariant, productName, qty, unitPrice]`, `userEmail`/`userFirstName`/`userLastName`, `marketingOptIn`) overlaps with: **Merchant** (canonical in `customer-account-services`, legacy in `pufferfish-shared-services`), **Order** (canonical writes in `write-services`, feeds ingested by `feed-services`), **Product/Page** (`product-services`, `core-data-services` CDM), and **User/Consumer PII** (`data-protection` is the GDPR/CCPA owner). The snippet transmits raw PII (email, first/last name) client-side — worth flagging against `data-protection`'s OneTrust/DSAR scope, since this is a public-facing PII collection surface that lives outside the platform's modern auth boundary.
+- **Architectural evolution**: The runtime code (`checkout.js`) has not changed since the **2016-02-12 initial commit** — 10 years frozen. All subsequent commits are CI/policy housekeeping: the secrets-scan workflow (2020-07), a README touch-up, and the `.whitesource` config (2026-03-23). The org has since shipped a modern beacon/widget stack (`ui-library`, `ui-library-core-web-vitals`, `ui-library-diagnostics`, `ui-library-hosted-collect`) that supersedes the v1 tracker surface — this repo is the last public-facing artifact still pointing customers at `t/v1/tracker.js`. Effectively dormant integration documentation rather than active code.
